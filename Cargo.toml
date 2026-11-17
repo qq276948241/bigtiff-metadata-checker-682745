@@ -1,0 +1,69 @@
+[package]
+name = "tiff"
+version = "0.11.3"
+edition = "2021"
+resolver = "2"
+
+# note: when changed, also update test runner in `.github/workflows/rust.yml`
+rust-version = "1.88.0"
+
+license = "MIT"
+description = "TIFF decoding and encoding library in pure Rust"
+authors = ["The image-rs Developers"]
+
+repository = "https://github.com/image-rs/image-tiff"
+categories = ["multimedia::images", "multimedia::encoding"]
+
+exclude = ["tests/images/*", "tests/fuzz_images/*", "tests/**/*.tif"]
+
+[dependencies]
+half = { version = "2.4.1" }
+quick-error = "2.0.1"
+
+# Rename to avoid confusion with the feature name.
+fax34 = { package = "fax", version = "0.2.6", optional = true }
+flate2 = { version = "1.0.20", optional = true }
+weezl = { version = "0.2.1", optional = true }
+zstd = { version = "0.14", optional = true }
+zrip-decode = { version = "0.8.2", features = ["paranoid"], optional = true }
+zune-jpeg = { version = "0.5.1", optional = true }
+image-webp = {version = "0.2.4", optional = true }
+
+[dev-dependencies]
+criterion = "0.3.1"
+# We may already depend on this via flate2
+crc32fast = "1.5"
+libtest-mimic = "0.8.1"
+walkdir = "2.5"
+
+[features]
+default = ["deflate", "fax", "jpeg", "lzw"]
+
+# Compression algorithms
+deflate = ["dep:flate2"]
+fax = ["dep:fax34"]
+jpeg = ["dep:zune-jpeg"]
+lzw = ["dep:weezl"]
+webp = ["dep:image-webp"]
+zstd = ["dep:zstd"]
+# Fully safe Rust but somewhat slower Zstd decoding.
+# When both zstd and zstd-safe-rust are enabled, zstd takes precedence.
+zstd-safe-rust = ["dep:zrip-decode"]
+
+[[bench]]
+name = "lzw"
+harness = false
+
+[[bench]]
+name = "encode"
+harness = false
+
+[[bench]]
+name = "decode"
+harness = false
+
+
+[[test]]
+name = "decode_libtiffpic"
+path = "tests/decode_libtiffpic.rs"
+harness = false

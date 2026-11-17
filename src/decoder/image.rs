@@ -1,0 +1,1642 @@
+use super::ifd::Value;
+use super::stream::PackBitsReader;
+use super::tag_reader::TagReader;
+use super::ChunkType;
+use super::{predict_f16, predict_f32, predict_f64, ValueReader};
+use crate::tags::{
+    ByteOrder, CompressionMethod, ExtraSamples, PhotometricInterpretation, PlanarConfiguration,
+    Predictor, SampleFormat, Tag,
+};
+use crate::{
+    ColorType, Directory, TiffError, TiffFormatError, TiffResult, TiffUnsupportedError, UsageError,
+};
+
+use std::io::{self, Cursor, Read, Seek};
+use std::sync::Arc;
+
+#[derive(Debug)]
+pub(crate) struct StripDecodeState {
+    pub rows_per_strip: u32,
+}
+
+#[derive(Debug)]
+/// Computed values useful for tile decoding
+pub(crate) struct TileAttributes {
+    pub image_width: usize,
+    pub image_height: usize,
+
+    pub tile_width: usize,
+    pub tile_length: usize,
+}
+
+impl TileAttributes {
+    pub fn tiles_across(&self) -> usize {
+        self.image_width.div_ceil(self.tile_width)
+    }
+    pub fn tiles_down(&self) -> usize {
+        self.image_height.div_ceil(self.tile_length)
+    }
+    fn padding_right(&self) -> usize {
+        (self.tile_width - self.image_width % self.tile_width) % self.tile_width
+    }
+    fn padding_down(&self) -> usize {
+        (self.tile_length - self.image_height % self.tile_length) % self.tile_length
+    }
+    pub fn get_padding(&self, tile: usize) -> (usize, usize) {
+        let row = tile / self.tiles_across();
+        let column = tile % self.tiles_across();
+
+        let padding_right = if column == self.tiles_across() - 1 {
+            self.padding_right()
+        } else {
+            0
+        };
+
+        let padding_down = if row == self.tiles_down() - 1 {
+            self.padding_down()
+        } else {
+            0
+        };
+
+        (padding_right, padding_down)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct Image {
+    pub width: u32,
+    pub height: u32,
+    pub bits_per_sample: u8,
+    pub samples: u16,
+    /// The `ExtraSamples`, defaulting to empty if not given.
+    pub extra_samples: Vec<ExtraSamples>,
+    /// Number of samples that belong to the photometric interpretation, samples except
+    /// `ExtraSamples` (338, 0x0152) tag.
+    pub photometric_samples: u16,
+    pub sample_format: SampleFormat,
+    pub photometric_interpretation: PhotometricInterpretation,
+    pub compression_method: CompressionMethod,
+    pub predictor: Predictor,
+    pub jpeg_tables: Option<Arc<Vec<u8>>>,
+    pub chunk_type: ChunkType,
+    pub planar_config: PlanarConfiguration,
+    pub strip_decoder: Option<StripDecodeState>,
+    pub tile_attributes: Option<TileAttributes>,
+    pub chunk_offsets: Vec<u64>,
+    pub chunk_bytes: Vec<u64>,
+    pub chroma_subsampling: (u16, u16),
+    /// FillOrder: 1 = MSB-to-LSB (default), 2 = LSB-to-MSB (common in fax images)
+    pub fill_order: u16,
+    /// The color map (palette) for `PhotometricInterpretation::RGBPalette`.
+    /// Contains `3 * 2^BitsPerSample` u16 entries: R values, then G values, then B values.
+    pub color_map: Option<Vec<u16>>,
+    /// Will decompression yield host-endian samples?
+    ///
+    /// Standard compression algorithms run on pure bytes, taking the sample slice as it would be
+    /// encoded in the file. However some compression algorithms (currently only SGILog/SGILog24)
+    /// run on samples directly and thus skip the outer byte order entirely, except potentially
+    /// they have interior byte order treatment.
+    pub decompression_to_host_endian: bool,
+    pub lenient: bool,
+}
+
+/// Describes how to read a tile-aligned portion of the image.
+#[derive(Clone)]
+pub(crate) struct ReadoutLayout {
+    /// The planar configuration, which applies to both the underlying image and the output buffer.
+    /// This may be relaxed if we find a clean enough way to provide it.
+    pub planar_config: PlanarConfiguration,
+
+    /// The sample interpretation (interpret with planar_config).
+    ///
+    /// FIXME: we should not require this here. The ability to turn out the raw bytes from the
+    /// sample arrays is very different from turning out interpretable color. Firstly we can always
+    /// readout `Multiband` but currently only use that ColorType in special circumstances (it must
+    /// not overlap cases where actually want to use a ColorType).
+    ///
+    /// And then we have CIE Lab, which uses a tuple of `(u8, i8, i8)`, that is still filterable
+    /// but still not represented by any of our `DecoderResult` variants. Other color variants
+    /// depend on extra tags (YCbCrCoefficients/0x0211) and we don't have a good side channel to
+    /// tag the output with all that TIFF specific information, so arguably we should process and
+    /// apply those to the data so it becomes a self-contained representation.
+    ///
+    /// This should be computed at a higher level, in `Decoder`, instead.
+    pub color: ColorType,
+    /// The number of bytes from one row to another.
+    pub minimum_row_stride: usize,
+    /// The format of samples (assumed uniform for now, same with depth of `ColorType`).
+    pub sample_format: SampleFormat,
+
+    /// Number of bytes to advance in output per row.
+    pub row_stride: usize,
+    /// Number of bytes to advance in output per chunk in width.
+    pub chunk_row_stride: usize,
+    /// Number of bytes to advance in output per chunk in height.
+    pub chunk_col_stride: usize,
+    /// Number of bytes in output from one plane to another.
+    pub plane_stride: usize,
+
+    /// Bits per sample in the encoded data.
+    pub tiff_bits_per_sample: u8,
+    /// Bits per sample in the output buffer, promoted to a standard width.
+    /// For sub-byte depths (1-8): same as tiff_bits_per_sample.
+    /// For 9-16: 16. For 17-32: 32. For 33-64: 64.
+    pub output_bits_per_sample: u8,
+    /// Number of samples in the encoded data.
+    pub tiff_samples: u16,
+    /// Dimensions of the underlying rectangular chunks (tile or strips).
+    pub tiff_chunk_dimensions: (u32, u32),
+    /// Number of bytes in the underlying data with all samples per row of chunks.
+    pub tiff_row_bytes: usize,
+
+    /// Chunks until wrapping to the next row of chunks.
+    pub chunks_across: u32,
+    /// Chunks to advance to get to the next plane of chunks.
+    pub chunks_per_plane: u32,
+}
+
+impl Image {
+    pub fn from_reader<R: Read + Seek>(
+        decoder: &mut ValueReader<R>,
+        ifd: &Directory,
+        lenient: bool,
+    ) -> TiffResult<Image> {
+        let mut tag_reader = TagReader { decoder, ifd };
+
+        let width = tag_reader.require_tag(Tag::ImageWidth)?.into_u32()?;
+        let height = tag_reader.require_tag(Tag::ImageLength)?.into_u32()?;
+        if width == 0 || height == 0 {
+            return Err(TiffError::FormatError(TiffFormatError::InvalidDimensions(
+                width, height,
+            )));
+        }
+
+        let photometric_interpretation = tag_reader
+            .find_tag(Tag::PhotometricInterpretation)?
+            .map(Value::into_u16)
+            .transpose()?
+            .and_then(PhotometricInterpretation::from_u16)
+            .ok_or(TiffUnsupportedError::UnknownInterpretation)?;
+
+        // Try to parse both the compression method and the number, format, and bits of the included samples.
+        // If they are not explicitly specified, those tags are reset to their default values and not carried from previous images.
+        let compression_method = match tag_reader.find_tag(Tag::Compression)? {
+            Some(val) => CompressionMethod::from_u16_exhaustive(val.into_u16()?),
+            None => CompressionMethod::None,
+        };
+
+        let jpeg_tables = if compression_method == CompressionMethod::ModernJPEG
+            && ifd.contains(Tag::JPEGTables)
+        {
+            let vec = tag_reader
+                .find_tag(Tag::JPEGTables)?
+                .unwrap()
+                .into_u8_vec()?;
+            if vec.len() < 2 {
+                return Err(TiffError::FormatError(
+                    TiffFormatError::InvalidTagValueType(Tag::JPEGTables),
+                ));
+            }
+
+            Some(Arc::new(vec))
+        } else {
+            None
+        };
+
+        let samples: u16 = tag_reader
+            .find_tag(Tag::SamplesPerPixel)?
+            .map(Value::into_u16)
+            .transpose()?
+            .unwrap_or(1);
+
+        if samples == 0 {
+            return Err(TiffFormatError::SamplesPerPixelIsZero.into());
+        }
+
+        let extra_samples = match tag_reader.find_tag(Tag::ExtraSamples)? {
+            Some(n) => n.into_u16_vec()?,
+            None => vec![],
+        };
+
+        let extra_samples = extra_samples
+            .into_iter()
+            .map(|x| ExtraSamples::from_u16(x).unwrap_or(ExtraSamples::Unspecified))
+            .collect::<Vec<_>>();
+
+        let photometric_samples = match usize::from(samples).checked_sub(extra_samples.len()) {
+            None => {
+                return Err(TiffError::FormatError(
+                    TiffFormatError::InconsistentSizesEncountered,
+                ));
+            }
+            Some(n) => n as u16,
+        };
+
+        let sample_format = match tag_reader.find_tag_uint_vec(Tag::SampleFormat)? {
+            Some(vals) => {
+                let sample_format: Vec<_> = vals
+                    .into_iter()
+                    .map(SampleFormat::from_u16_exhaustive)
+                    .collect();
+
+                let Some(format) = sample_format.first().copied() else {
+                    // Reject empty sample formats
+                    return Err(TiffFormatError::InvalidTagValueType(Tag::SampleFormat).into());
+                };
+                // TODO: for now, only homogenous formats across samples are supported.
+                if !sample_format.iter().all(|&s| s == format) {
+                    return Err(TiffUnsupportedError::UnsupportedSampleFormat(sample_format).into());
+                }
+                format
+            }
+            None => SampleFormat::Uint,
+        };
+
+        let bits_per_sample: Vec<u8> = tag_reader
+            .find_tag_uint_vec(Tag::BitsPerSample)?
+            .unwrap_or_else(|| vec![1]);
+
+        // Technically bits_per_sample.len() should be *equal* to samples, but libtiff also allows
+        // it to be a single value that applies to all samples.
+        if bits_per_sample.len() != usize::from(samples) && bits_per_sample.len() != 1 {
+            return Err(TiffError::FormatError(
+                TiffFormatError::InconsistentSizesEncountered,
+            ));
+        }
+
+        // This library (and libtiff) do not support mixed sample formats and zero bits per sample
+        // doesn't make sense.
+        if bits_per_sample.iter().any(|&b| b != bits_per_sample[0]) || bits_per_sample[0] == 0 {
+            return Err(TiffUnsupportedError::InconsistentBitsPerSample(bits_per_sample).into());
+        }
+
+        let predictor = tag_reader
+            .find_tag(Tag::Predictor)?
+            .map(Value::into_u16)
+            .transpose()?
+            .map(|p| {
+                Predictor::from_u16(p)
+                    .ok_or(TiffError::FormatError(TiffFormatError::UnknownPredictor(p)))
+            })
+            .transpose()?
+            .unwrap_or(Predictor::None);
+
+        let planar_config = tag_reader
+            .find_tag(Tag::PlanarConfiguration)?
+            .map(Value::into_u16)
+            .transpose()?
+            .map(|p| {
+                PlanarConfiguration::from_u16(p).ok_or(TiffError::FormatError(
+                    TiffFormatError::UnknownPlanarConfiguration(p),
+                ))
+            })
+            .transpose()?
+            .unwrap_or(PlanarConfiguration::Chunky);
+
+        let ycbcr_subsampling = tag_reader.find_tag_uint_vec::<u16>(Tag::ChromaSubsampling)?;
+
+        let chroma_subsampling = if let Some(subsamples) = &ycbcr_subsampling {
+            let [a, b] = subsamples.as_slice() else {
+                return Err(TiffError::FormatError(TiffFormatError::InvalidCountForTag(
+                    Tag::ChromaSubsampling,
+                    subsamples.len(),
+                )));
+            };
+
+            // ImageWidth and ImageLength are constrained to be integer multiples of
+            // YCbCrSubsampleHoriz and YCbCrSubsampleVert respectively. TileWidth and TileLength
+            // have the same constraints. RowsPerStrip must be an integer multiple of
+            // YCbCrSubsampleVert.
+            (*a, *b)
+        } else {
+            (2, 2)
+        };
+
+        let fill_order = tag_reader
+            .find_tag(Tag::FillOrder)?
+            .map(Value::into_u16)
+            .transpose()?
+            .unwrap_or(1);
+
+        let planes = match planar_config {
+            PlanarConfiguration::Chunky => 1,
+            PlanarConfiguration::Planar => samples,
+        };
+
+        // Note: Not strictly according to specification. The specification says that tiled images
+        // must have their data encoded in `TileByteCounts` and `TileOffsets`. But `libtiff`
+        // processes tags one-by-one and with *either* of these it will set the flag for the image
+        // being tiled. Also it will just use whatever offsets are available. (I believe also using
+        // the first of the two tag pairs that's available—remember tags are encoded ascending).
+        let is_tiled = ifd.contains(Tag::TileWidth) || ifd.contains(Tag::TileLength);
+        let has_strips = ifd.contains(Tag::StripByteCounts) && ifd.contains(Tag::StripOffsets);
+        let has_tiles = ifd.contains(Tag::TileByteCounts) && ifd.contains(Tag::TileOffsets);
+
+        let chunk_type;
+        let chunk_offsets;
+        let chunk_bytes;
+        let strip_decoder;
+        let tile_attributes;
+
+        if !is_tiled && has_strips {
+            chunk_type = ChunkType::Strip;
+
+            chunk_offsets = tag_reader
+                .find_tag(Tag::StripOffsets)?
+                .unwrap()
+                .into_u64_vec()?;
+            chunk_bytes = tag_reader
+                .find_tag(Tag::StripByteCounts)?
+                .unwrap()
+                .into_u64_vec()?;
+            let rows_per_strip = tag_reader
+                .find_tag(Tag::RowsPerStrip)?
+                .map(Value::into_u32)
+                .transpose()?
+                .unwrap_or(height);
+            strip_decoder = Some(StripDecodeState { rows_per_strip });
+            tile_attributes = None;
+
+            if chunk_offsets.len() != chunk_bytes.len() {
+                return Err(TiffError::FormatError(
+                    TiffFormatError::InconsistentSizesEncountered,
+                ));
+            }
+
+            if rows_per_strip == 0 {
+                return Err(TiffError::FormatError(
+                    TiffFormatError::InconsistentSizesEncountered,
+                ));
+            }
+
+            if u32::try_from(chunk_offsets.len())?
+                != height.div_ceil(rows_per_strip) * planes as u32
+            {
+                return Err(TiffError::FormatError(
+                    TiffFormatError::IncorrectChunkCount {
+                        expected: height.div_ceil(rows_per_strip) * planes as u32,
+                        found: chunk_offsets.len() as u32,
+                    },
+                ));
+            }
+        } else if is_tiled && (has_strips || has_tiles) {
+            chunk_type = ChunkType::Tile;
+
+            let tile_width = usize::try_from(tag_reader.require_tag(Tag::TileWidth)?.into_u32()?)?;
+            let tile_length =
+                usize::try_from(tag_reader.require_tag(Tag::TileLength)?.into_u32()?)?;
+
+            // Prioritize tiles over strips, tiles are what we expect.
+            let (tag_offsets, tag_counts) = if has_tiles {
+                (Tag::TileOffsets, Tag::TileByteCounts)
+            } else {
+                (Tag::StripOffsets, Tag::StripByteCounts)
+            };
+
+            if tile_width == 0 {
+                return Err(TiffFormatError::InvalidTagValueType(Tag::TileWidth).into());
+            } else if tile_length == 0 {
+                return Err(TiffFormatError::InvalidTagValueType(Tag::TileLength).into());
+            }
+
+            strip_decoder = None;
+            tile_attributes = Some(TileAttributes {
+                image_width: usize::try_from(width)?,
+                image_height: usize::try_from(height)?,
+                tile_width,
+                tile_length,
+            });
+
+            chunk_offsets = tag_reader.find_tag(tag_offsets)?.unwrap().into_u64_vec()?;
+            chunk_bytes = tag_reader.find_tag(tag_counts)?.unwrap().into_u64_vec()?;
+
+            let tile = tile_attributes.as_ref().unwrap();
+
+            if chunk_offsets.len() != chunk_bytes.len() {
+                return Err(TiffError::FormatError(
+                    TiffFormatError::InconsistentSizesEncountered,
+                ));
+            }
+
+            if chunk_offsets.len() != tile.tiles_down() * tile.tiles_across() * planes as usize {
+                return Err(TiffError::FormatError(
+                    TiffFormatError::IncorrectChunkCount {
+                        expected: (tile.tiles_down() * tile.tiles_across() * planes as usize)
+                            as u32,
+                        found: chunk_offsets.len() as u32,
+                    },
+                ));
+            }
+        } else {
+            return Err(TiffError::FormatError(
+                TiffFormatError::StripTileTagConflict,
+            ));
+        };
+
+        let mut sample_format = sample_format;
+        let mut bits_per_sample = bits_per_sample[0];
+
+        // These compression methods only work for specific sample types. They pack each pixel into
+        // a pixel format. And when we decompress them we run an inverse transform inside the
+        // decompression step because that makes sense. (Even for 'raw' data you will not be able
+        // to handle the samples well otherwise). All we are doing is setting up the internal
+        // buffer here. There's an additional transform before the color readout as yo will receive
+        // the color as 32-bit floats (the encoding relies on very specific quantization so
+        // everything else would be very lossy).
+        if let CompressionMethod::SgiLog = compression_method {
+            sample_format = SampleFormat::IEEEFP;
+            bits_per_sample = 32;
+        } else if let CompressionMethod::SgiLog24 = compression_method {
+            sample_format = SampleFormat::IEEEFP;
+            bits_per_sample = 32;
+        }
+
+        // Read ColorMap for palette images. The tag contains 3 * 2^BitsPerSample u16 entries.
+        let color_map = if photometric_interpretation == PhotometricInterpretation::RGBPalette {
+            match tag_reader.find_tag(Tag::ColorMap)? {
+                Some(v) => {
+                    let map = v.into_u16_vec()?;
+                    let expected_len = 1usize
+                        .checked_shl(bits_per_sample as u32)
+                        .and_then(|n| n.checked_mul(3))
+                        .ok_or(TiffError::LimitsExceeded)?;
+                    if map.len() != expected_len {
+                        return Err(TiffError::FormatError(
+                            TiffFormatError::InconsistentSizesEncountered,
+                        ));
+                    }
+                    Some(map)
+                }
+                None => {
+                    return Err(TiffError::FormatError(
+                        TiffFormatError::RequiredTagNotFound(Tag::ColorMap),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(Image {
+            width,
+            height,
+            bits_per_sample,
+            samples,
+            extra_samples,
+            photometric_samples,
+            sample_format,
+            photometric_interpretation,
+            compression_method,
+            jpeg_tables,
+            predictor,
+            chunk_type,
+            planar_config,
+            strip_decoder,
+            tile_attributes,
+            chunk_offsets,
+            chunk_bytes,
+            chroma_subsampling,
+            fill_order,
+            color_map,
+            decompression_to_host_endian: matches!(
+                compression_method,
+                CompressionMethod::SgiLog | CompressionMethod::SgiLog24
+            ),
+            lenient,
+        })
+    }
+
+    pub(crate) fn check_chunk_type(&self, expected: ChunkType) -> TiffResult<()> {
+        if expected != self.chunk_type {
+            return Err(TiffError::UsageError(UsageError::InvalidChunkType(
+                expected,
+                self.chunk_type,
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn colortype(&self) -> TiffResult<ColorType> {
+        let is_alpha_extra_samples = match self.extra_samples.as_slice().first() {
+            Some(ExtraSamples::AssociatedAlpha) | Some(ExtraSamples::UnassociatedAlpha) => true,
+            // In lenient mode, keep unspecified alpha interpretation logic compatible with libtiff
+            // See Issue #341
+            Some(ExtraSamples::Unspecified) if self.lenient && self.samples > 3 => true,
+            _ => false,
+        };
+
+        match self.photometric_interpretation {
+            PhotometricInterpretation::RGB => match self.photometric_samples {
+                3 => Ok(if is_alpha_extra_samples {
+                    ColorType::RGBA(self.bits_per_sample)
+                } else {
+                    ColorType::RGB(self.bits_per_sample)
+                }),
+                4 => Ok(ColorType::RGBA(self.bits_per_sample)),
+                _ => Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::InterpretationWithBits(
+                        self.photometric_interpretation,
+                        vec![self.bits_per_sample; self.samples as usize],
+                    ),
+                )),
+            },
+            PhotometricInterpretation::CMYK => match self.photometric_samples {
+                4 => Ok(if is_alpha_extra_samples {
+                    ColorType::CMYKA(self.bits_per_sample)
+                } else {
+                    ColorType::CMYK(self.bits_per_sample)
+                }),
+                5 => Ok(ColorType::CMYKA(self.bits_per_sample)),
+                _ => Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::InterpretationWithBits(
+                        self.photometric_interpretation,
+                        vec![self.bits_per_sample; self.samples as usize],
+                    ),
+                )),
+            },
+            PhotometricInterpretation::YCbCr => match self.photometric_samples {
+                3 => Ok(ColorType::YCbCr(self.bits_per_sample)),
+                _ => Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::InterpretationWithBits(
+                        self.photometric_interpretation,
+                        vec![self.bits_per_sample; self.samples as usize],
+                    ),
+                )),
+            },
+            // TODO: treatment of WhiteIsZero is not quite consistent with `invert_colors` that is
+            // later called when that interpretation is read. That function does not support
+            // Multiband as a color type and will error. It's unclear how to resolve that exactly.
+            PhotometricInterpretation::BlackIsZero | PhotometricInterpretation::WhiteIsZero => {
+                // Note: compatibility with previous implementation requires us to return extra
+                // samples as `Multiband`. For gray images however the better choice would be
+                // returning a `Gray` color, i.e. matching on `photometric_samples` instead.
+                match self.samples {
+                    1 => Ok(ColorType::Gray(self.bits_per_sample)),
+                    _ => Ok(ColorType::Multiband {
+                        bit_depth: self.bits_per_sample,
+                        num_samples: self.samples,
+                    }),
+                }
+            }
+            // ```
+            // struct IccLab /* Interpretation 9* {
+            //     pub L: u8, // SampleFormat::Uint
+            //     pub a: u8, // SampleFormat::Uint, defined as TiffLab::a + 128
+            //     pub b: u8, // SampleFormat::Uint, defined as TiffLab::b + 128
+            // }
+            // ```
+            PhotometricInterpretation::IccLab => match self.photometric_samples {
+                3 if matches!(self.sample_format, SampleFormat::Uint) => {
+                    Ok(ColorType::Lab(self.bits_per_sample))
+                }
+                _ => Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::InterpretationWithBits(
+                        self.photometric_interpretation,
+                        vec![self.bits_per_sample; self.samples as usize],
+                    ),
+                )),
+            },
+            // CIE L*a*b* (TIFF6 Section 23, pp 110-115) encodes a/b as signed integers
+            // (int8 at 8-bit, int16 at 16-bit) with 0 neutral, while ICC L*a*b*
+            // (photometric=9) uses unsigned samples with the neutral at the middle of
+            // the range. `SampleFormat` applies uniformly to all samples, so it can't
+            // describe the L=unsigned + a/b=signed mix; instead we take a/b as signed
+            // from the photometric interpretation (requiring `SampleFormat::Uint`, like
+            // the ICCLab arm) and re-bias them to the unsigned ICCLab encoding in
+            // post-processing (see `cielab_to_icclab`). libtiff does the same, decoding
+            // both depths (`putcontig8bitCIELab8` / `putcontig8bitCIELab16`, selected by
+            // `initCIELabConversion` in tif_getimage.c line 2216
+            // @ 04884181e8903915038be553bfab404302d98ea0).
+            PhotometricInterpretation::CIELab => match self.photometric_samples {
+                3 if matches!(self.bits_per_sample, 8 | 16)
+                    && matches!(self.sample_format, SampleFormat::Uint) =>
+                {
+                    Ok(ColorType::Lab(self.bits_per_sample))
+                }
+                _ => Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::InterpretationWithBits(
+                        PhotometricInterpretation::CIELab,
+                        vec![self.bits_per_sample; self.samples as usize],
+                    ),
+                )),
+            },
+            PhotometricInterpretation::CIELogL => match self.samples {
+                1 if matches!(self.bits_per_sample, 32)
+                    && matches!(self.sample_format, SampleFormat::IEEEFP) =>
+                {
+                    // We do this transform internally while reading.
+                    Ok(ColorType::Gray(32))
+                }
+                _ => Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::InterpretationWithBits(
+                        self.photometric_interpretation,
+                        vec![self.bits_per_sample; self.samples as usize],
+                    ),
+                )),
+            },
+            PhotometricInterpretation::CIELogLuv => match self.samples {
+                // Only fully supported for the compression format `SGILog`/`SGILog24` which must
+                // be used with 16-bit per sample.
+                //
+                // It's actually an interesting point what we should output here. Note that in
+                // libtiff there is a RAW mode (a single unsigned sample per pixel) as well as a
+                // 32-bit floating point mode for XYZ data. The `Lu'v'` variant is a heavily
+                // customized quantization so we should not return it directly. The format itself
+                // describes being based off `xyY` so that may make sense but there is a pole in
+                // the relation to `XYZ` (at y=0) which is absent in the chosen quantization since
+                // we assume a bias of `.5` so `v >= 1/820` and thus `y >= 0.49/820` in practice.
+                // Also we lose a bit of accuracy with just 16-bit precision.
+                //
+                // In `libtiff` data is always transformed through XYZ. So let's do that.
+                3 if matches!(self.bits_per_sample, 32)
+                    && matches!(self.sample_format, SampleFormat::IEEEFP) =>
+                {
+                    Ok(ColorType::RGB(32))
+                }
+                _ => Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::InterpretationWithBits(
+                        self.photometric_interpretation,
+                        vec![self.bits_per_sample; self.samples as usize],
+                    ),
+                )),
+            },
+            // Unsupported due to extra unfiltering and conversion steps. We need to find the
+            // Decode tag (SRATIONAL; 2 * SamplesPerPixel) and apply the following conversion:
+            //
+            // L* = Decode[0] + Lsample x (Decode[1] - Decode[0]) / (2^n -1)
+            // …
+            //
+            // So we'll have a larger depth in the output and either worry about reducing fractions
+            // or turn everything into floats. That's a lot of decisions.
+            PhotometricInterpretation::ItuLab => Err(TiffError::UnsupportedError(
+                TiffUnsupportedError::InterpretationWithBits(
+                    PhotometricInterpretation::CIELab,
+                    vec![self.bits_per_sample; self.samples as usize],
+                ),
+            )),
+            PhotometricInterpretation::RGBPalette => Ok(ColorType::Palette(self.bits_per_sample)),
+            // TransparencyMask is a single-channel mask, treat as grayscale.
+            PhotometricInterpretation::TransparencyMask => {
+                Ok(ColorType::Gray(self.bits_per_sample))
+            }
+            PhotometricInterpretation::Unknown(_) => Err(TiffError::UnsupportedError(
+                TiffUnsupportedError::InterpretationWithBits(
+                    self.photometric_interpretation,
+                    vec![self.bits_per_sample; self.samples as usize],
+                ),
+            )),
+        }
+    }
+
+    fn create_reader<'r, R: 'r + Read + Seek>(
+        reader: R,
+        compression_method: CompressionMethod,
+        compressed_length: u64,
+        // FIXME: these should be `expect` attributes or we choose another way of passing them.
+        #[cfg_attr(not(feature = "jpeg"), allow(unused_variables))] jpeg_tables: Option<&[u8]>,
+        dimensions: (u32, u32),
+        samples: u16,
+        #[cfg_attr(not(feature = "fax"), allow(unused_variables))] fill_order: u16,
+    ) -> TiffResult<Box<dyn Read + 'r>> {
+        Ok(match compression_method {
+            CompressionMethod::None => Box::new(reader),
+            CompressionMethod::SgiLog => match samples {
+                1 => Box::new(super::logluv::LogLuv16::new(
+                    reader,
+                    compressed_length,
+                    dimensions.0,
+                )?),
+                3 => Box::new(super::logluv::LogLuv32::new(
+                    reader,
+                    compressed_length,
+                    dimensions.0,
+                )?),
+                _ => {
+                    return Err(TiffError::UnsupportedError(
+                        TiffUnsupportedError::UnsupportedCompressionMethod(
+                            CompressionMethod::SgiLog,
+                        ),
+                    ))
+                }
+            },
+            CompressionMethod::SgiLog24 => Box::new(super::logluv::LogLuv24::new(
+                reader,
+                compressed_length,
+                dimensions.0,
+            )?),
+            #[cfg(feature = "lzw")]
+            CompressionMethod::LZW => Box::new(super::stream::LZWReader::new(
+                reader,
+                usize::try_from(compressed_length)?,
+            )),
+            #[cfg(feature = "zstd")]
+            CompressionMethod::ZSTD => Box::new(zstd::Decoder::new(reader)?),
+            #[cfg(all(not(feature = "zstd"), feature = "zstd-safe-rust"))]
+            CompressionMethod::ZSTD => Box::new(zrip_decode::streaming::FrameDecoder::new(reader)),
+            CompressionMethod::PackBits => Box::new(PackBitsReader::new(reader, compressed_length)),
+            #[cfg(feature = "deflate")]
+            CompressionMethod::Deflate | CompressionMethod::OldDeflate => {
+                Box::new(super::stream::DeflateReader::new(reader))
+            }
+            #[cfg(feature = "jpeg")]
+            CompressionMethod::ModernJPEG => {
+                use zune_jpeg::zune_core;
+
+                if jpeg_tables.is_some() && compressed_length < 2 {
+                    return Err(TiffError::FormatError(
+                        TiffFormatError::InvalidTagValueType(Tag::JPEGTables),
+                    ));
+                }
+
+                // Construct new jpeg_reader wrapping a SmartReader.
+                //
+                // JPEG compression in TIFF allows saving quantization and/or huffman tables in one
+                // central location. These `jpeg_tables` are simply prepended to the remaining jpeg image data.
+                // Because these `jpeg_tables` start with a `SOI` (HEX: `0xFFD8`) or __start of image__ marker
+                // which is also at the beginning of the remaining JPEG image data and would
+                // confuse the JPEG renderer, one of these has to be taken off. In this case the first two
+                // bytes of the remaining JPEG data is removed because it follows `jpeg_tables`.
+                // Similary, `jpeg_tables` ends with a `EOI` (HEX: `0xFFD9`) or __end of image__ marker,
+                // this has to be removed as well (last two bytes of `jpeg_tables`).
+                let mut jpeg_reader = match jpeg_tables {
+                    Some(jpeg_tables) => {
+                        let mut reader = reader.take(compressed_length);
+                        reader.read_exact(&mut [0; 2])?;
+
+                        Box::new(
+                            Cursor::new(&jpeg_tables[..jpeg_tables.len() - 2])
+                                .chain(reader.take(compressed_length)),
+                        ) as Box<dyn Read>
+                    }
+                    None => Box::new(reader.take(compressed_length)),
+                };
+
+                let mut jpeg_data = Vec::new();
+                jpeg_reader.read_to_end(&mut jpeg_data)?;
+
+                let mut decoder =
+                    zune_jpeg::JpegDecoder::new(zune_core::bytestream::ZCursor::new(jpeg_data));
+                let mut options: zune_core::options::DecoderOptions = Default::default();
+
+                // Disable color conversion by setting the output colorspace to the input
+                // colorspace.
+                decoder.decode_headers()?;
+                if let Some(colorspace) = decoder.input_colorspace() {
+                    options = options.jpeg_set_out_colorspace(colorspace);
+                }
+
+                decoder.set_options(options);
+
+                let data = decoder.decode()?;
+
+                Box::new(Cursor::new(data))
+            }
+            #[cfg(feature = "fax")]
+            CompressionMethod::Fax3 => Box::new(super::stream::Group3Reader::new(
+                dimensions,
+                reader,
+                compressed_length,
+                fill_order,
+            )?),
+            #[cfg(feature = "fax")]
+            CompressionMethod::Fax4 => Box::new(super::stream::Group4Reader::new(
+                dimensions,
+                reader,
+                compressed_length,
+                fill_order,
+            )?),
+            #[cfg(feature = "webp")]
+            CompressionMethod::WebP => Box::new(super::stream::WebPReader::new(
+                reader,
+                compressed_length,
+                samples,
+            )?),
+
+            method => {
+                return Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::UnsupportedCompressionMethod(method),
+                ))
+            }
+        })
+    }
+
+    /// Samples per pixel within chunk.
+    ///
+    /// In planar config, samples are stored in separate strips/chunks, also called bands.
+    ///
+    /// Example with `bits_per_sample = [8, 8, 8]` and `PhotometricInterpretation::RGB`:
+    /// * `PlanarConfiguration::Chunky` -> 3 (RGBRGBRGB...)
+    /// * `PlanarConfiguration::Planar` -> 1 (RRR...) (GGG...) (BBB...)
+    pub(crate) fn samples_per_pixel(&self) -> u16 {
+        match self.planar_config {
+            PlanarConfiguration::Chunky => self.samples,
+            PlanarConfiguration::Planar => 1,
+        }
+    }
+
+    pub(crate) fn samples_per_out_texel(&self, color: ColorType) -> u16 {
+        match self.planar_config {
+            PlanarConfiguration::Chunky => color.num_samples(),
+            PlanarConfiguration::Planar => 1,
+        }
+    }
+
+    /// Number of strips per pixel.
+    pub(crate) fn strips_per_pixel(&self) -> u16 {
+        match self.planar_config {
+            PlanarConfiguration::Chunky => 1,
+            PlanarConfiguration::Planar => self.samples,
+        }
+    }
+
+    pub(crate) fn chunk_file_range(&self, chunk: u32) -> TiffResult<(u64, u64)> {
+        let file_offset = self
+            .chunk_offsets
+            .get(chunk as usize)
+            .ok_or(TiffError::FormatError(
+                TiffFormatError::InconsistentSizesEncountered,
+            ))?;
+
+        let compressed_bytes =
+            self.chunk_bytes
+                .get(chunk as usize)
+                .ok_or(TiffError::FormatError(
+                    TiffFormatError::InconsistentSizesEncountered,
+                ))?;
+
+        Ok((*file_offset, *compressed_bytes))
+    }
+
+    pub(crate) fn chunk_dimensions(&self) -> TiffResult<(u32, u32)> {
+        match self.chunk_type {
+            ChunkType::Strip => {
+                let strip_attrs = self.strip_decoder.as_ref().unwrap();
+                Ok((self.width, strip_attrs.rows_per_strip))
+            }
+            ChunkType::Tile => {
+                let tile_attrs = self.tile_attributes.as_ref().unwrap();
+                Ok((
+                    u32::try_from(tile_attrs.tile_width)?,
+                    u32::try_from(tile_attrs.tile_length)?,
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn readout_for_image(&self) -> TiffResult<ReadoutLayout> {
+        let Image { width, height, .. } = *self;
+        self.readout_for_size(width, height)
+    }
+
+    /// Get the layout for reading out a tile-aligned portion of the image.
+    ///
+    /// The provided width and height should be less than or equal to the image dimensions.
+    pub(crate) fn readout_for_size(&self, width: u32, height: u32) -> TiffResult<ReadoutLayout> {
+        let color = self.colortype()?;
+
+        let tiff_samples = self.samples_per_pixel();
+        let tiff_bits_per_sample = self.bits_per_sample;
+        let data_samples = self.samples_per_out_texel(color);
+        let tiff_chunk_dimensions = self.chunk_dimensions()?;
+        let strips_per_pixel = self.strips_per_pixel();
+
+        let data_dimensions = (width, height);
+
+        // Output bits per sample: sub-byte depths stay packed, supra-byte non-standard
+        // depths are promoted to the next standard width (matching sample_type() mapping).
+        let output_bits_per_sample: u8 = match tiff_bits_per_sample {
+            0..=8 => tiff_bits_per_sample,
+            9..=16 => 16,
+            17..=32 => 32,
+            _ => 64,
+        };
+
+        // Packed row size for reading from the file (uses tiff_bits_per_sample).
+        let tiff_row_bits = (u64::from(tiff_chunk_dimensions.0) * u64::from(tiff_bits_per_sample))
+            .checked_mul(u64::from(tiff_samples))
+            .ok_or(TiffError::LimitsExceeded)?;
+        let tiff_row_bytes: usize = tiff_row_bits.div_ceil(8).try_into()?;
+
+        // Output buffer sizes use output_bits_per_sample (the promoted width).
+        let chunk_row_bits = (u64::from(tiff_chunk_dimensions.0)
+            * u64::from(output_bits_per_sample))
+        .checked_mul(u64::from(data_samples))
+        .ok_or(TiffError::LimitsExceeded)?;
+        let chunk_row_bytes: usize = chunk_row_bits.div_ceil(8).try_into()?;
+
+        let data_row_bits = (u64::from(data_dimensions.0) * u64::from(output_bits_per_sample))
+            .checked_mul(u64::from(data_samples))
+            .ok_or(TiffError::LimitsExceeded)?;
+        let data_row_bytes: usize = data_row_bits.div_ceil(8).try_into()?;
+
+        // Clamp the chunk height to the image height: a chunk never contributes more
+        // rows than the image contains. Without this, RowsPerStrip = u32::MAX overflows
+        // usize on 32-bit platforms.
+        let clamped_chunk_height = tiff_chunk_dimensions.1.min(data_dimensions.1);
+        let chunk_col_stride: usize = data_row_bits
+            .div_ceil(8)
+            .checked_mul(u64::from(clamped_chunk_height))
+            .ok_or(TiffError::LimitsExceeded)?
+            .try_into()?;
+
+        let plane_stride: usize = data_row_bits
+            .div_ceil(8)
+            .checked_mul(u64::from(data_dimensions.1))
+            .ok_or(TiffError::LimitsExceeded)?
+            .try_into()?;
+
+        let minimum_row_stride = data_row_bytes;
+
+        let chunks_across: u32 = data_dimensions.0.div_ceil(tiff_chunk_dimensions.0);
+        let chunks_per_plane = (self.chunk_offsets.len() as u32) / u32::from(strips_per_pixel);
+
+        // We would not get an offset in byte units, sorry, no bit interleaving in the output.
+        if chunks_across > 1 && chunk_row_bits % 8 != 0 {
+            return Err(TiffError::UnsupportedError(
+                TiffUnsupportedError::MisalignedTileBoundaries,
+            ));
+        }
+
+        // Only this color type interprets the tag, which is defined with a default of (2, 2)
+        if matches!(color, ColorType::YCbCr(_)) && self.chroma_subsampling != (1, 1) {
+            // The JPEG library does upsampling for us and defines its buffers correctly
+            // (presumably). All other compression schemes are not supported..
+            //
+            // NOTE: as explained in <fa225e820b96bef35f01bf4685654beeb4a8df0c> we may be better
+            // off supporting this tag by consistently upsampling, not by adjusting the buffer
+            // size. At least as a default this makes more sense and is much more permissive in
+            // case the compression stream disagrees with the tags (we would not have enough / or
+            // the wrong buffer layout if we only asked for subsampled planes in a planar layout).
+            if !matches!(self.compression_method, CompressionMethod::ModernJPEG) {
+                return Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::ChromaSubsampling,
+                ));
+            }
+        }
+
+        Ok(ReadoutLayout {
+            planar_config: self.planar_config,
+            color,
+            minimum_row_stride,
+            sample_format: self.sample_format,
+            row_stride: data_row_bytes,
+            chunk_row_stride: chunk_row_bytes,
+            chunk_col_stride,
+            plane_stride,
+            tiff_bits_per_sample,
+            output_bits_per_sample,
+            tiff_samples,
+            tiff_chunk_dimensions,
+            tiff_row_bytes,
+            chunks_across,
+            chunks_per_plane,
+        })
+    }
+
+    pub(crate) fn chunk_data_dimensions(&self, chunk_index: u32) -> TiffResult<(u32, u32)> {
+        let dims = self.chunk_dimensions()?;
+
+        match self.chunk_type {
+            ChunkType::Strip => {
+                let rows_per_strip = dims.1;
+                let strips_per_band = self.height.div_ceil(rows_per_strip);
+
+                let strip_height_without_padding = (chunk_index % strips_per_band)
+                    .checked_mul(dims.1)
+                    .and_then(|x| self.height.checked_sub(x))
+                    .ok_or(TiffError::UsageError(UsageError::InvalidChunkIndex(
+                        chunk_index,
+                    )))?;
+
+                // Ignore potential vertical padding on the bottommost strip
+                let strip_height = dims.1.min(strip_height_without_padding);
+
+                Ok((dims.0, strip_height))
+            }
+            ChunkType::Tile => {
+                let tile_attrs = self.tile_attributes.as_ref().unwrap();
+                let (padding_right, padding_down) = tile_attrs.get_padding(chunk_index as usize);
+
+                let tile_width = tile_attrs.tile_width - padding_right;
+                let tile_length = tile_attrs.tile_length - padding_down;
+
+                Ok((u32::try_from(tile_width)?, u32::try_from(tile_length)?))
+            }
+        }
+    }
+
+    pub(crate) fn expand_chunk(
+        &self,
+        reader: &mut ValueReader<impl Read + Seek>,
+        buf: &mut [u8],
+        layout: &ReadoutLayout,
+        chunk_index: u32,
+        scratch: &mut Vec<u8>,
+    ) -> TiffResult<()> {
+        let ValueReader {
+            reader,
+            bigtiff: _,
+            limits,
+        } = reader;
+
+        let decompressed_byte_order = if self.decompression_to_host_endian {
+            ByteOrder::native()
+        } else {
+            // Convert from the byte order of the file.
+            reader.byte_order
+        };
+
+        // Validate that the color type is supported.
+        let color_type = layout.color;
+
+        match color_type {
+            ColorType::RGB(n)
+            | ColorType::RGBA(n)
+            | ColorType::CMYK(n)
+            | ColorType::CMYKA(n)
+            | ColorType::YCbCr(n)
+            | ColorType::Gray(n)
+            | ColorType::Palette(n)
+            | ColorType::Lab(n)
+            | ColorType::Multiband {
+                bit_depth: n,
+                num_samples: _,
+            } if n == 8 || n == 16 || n == 32 || n == 64 => {}
+            ColorType::RGB(n)
+            | ColorType::RGBA(n)
+            | ColorType::CMYK(n)
+            | ColorType::CMYKA(n)
+            | ColorType::YCbCr(n)
+            | ColorType::Gray(n)
+            | ColorType::Palette(n)
+            | ColorType::Lab(n)
+            | ColorType::Multiband {
+                bit_depth: n,
+                num_samples: _,
+            } if n < 8 => match self.predictor {
+                Predictor::None => {}
+                Predictor::Horizontal => {
+                    return Err(TiffError::UnsupportedError(
+                        TiffUnsupportedError::HorizontalPredictor(color_type),
+                    ));
+                }
+                Predictor::FloatingPoint => {
+                    return Err(TiffError::UnsupportedError(
+                        TiffUnsupportedError::FloatingPointPredictor(color_type),
+                    ));
+                }
+            },
+            // Extended bit depths (9-15, 17-31): packed N-bit samples unpacked to standard width.
+            // Horizontal predictor is supported (operates on unpacked standard-width samples).
+            // FloatingPoint predictor is not meaningful for non-standard integer depths.
+            ColorType::RGB(n)
+            | ColorType::RGBA(n)
+            | ColorType::CMYK(n)
+            | ColorType::CMYKA(n)
+            | ColorType::YCbCr(n)
+            | ColorType::Gray(n)
+            | ColorType::Multiband {
+                bit_depth: n,
+                num_samples: _,
+            } if n <= 32 => match self.predictor {
+                Predictor::None | Predictor::Horizontal => {}
+                Predictor::FloatingPoint => {
+                    return Err(TiffError::UnsupportedError(
+                        TiffUnsupportedError::FloatingPointPredictor(color_type),
+                    ));
+                }
+            },
+            type_ => {
+                return Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::UnsupportedColorType(type_),
+                ));
+            }
+        }
+
+        // Validate that the predictor is supported for the sample type.
+        match (self.predictor, self.sample_format) {
+            (
+                Predictor::Horizontal,
+                SampleFormat::Int | SampleFormat::Uint | SampleFormat::IEEEFP,
+            ) => {}
+            (Predictor::Horizontal, _) => {
+                return Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::HorizontalPredictor(color_type),
+                ));
+            }
+            (Predictor::FloatingPoint, SampleFormat::IEEEFP) => {}
+            (Predictor::FloatingPoint, _) => {
+                return Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::FloatingPointPredictor(color_type),
+                ));
+            }
+            _ => {}
+        }
+
+        let compressed_bytes =
+            self.chunk_bytes
+                .get(chunk_index as usize)
+                .ok_or(TiffError::FormatError(
+                    TiffFormatError::InconsistentSizesEncountered,
+                ))?;
+
+        if *compressed_bytes > limits.intermediate_buffer_size as u64 {
+            return Err(TiffError::LimitsExceeded);
+        }
+
+        let compression_method = self.compression_method;
+        let photometric_interpretation = self.photometric_interpretation;
+        let predictor = self.predictor;
+
+        let samples = layout.tiff_samples;
+        let data_samples = layout.samples_per_out_texel();
+
+        // We have two dimensions: the 2d rectangle of encoded data and the 2d rectangle this
+        // takes up in the output. Each has an associated count of bits per pixel. The first
+        // dimension, i.e. a ''row'', is the number of pixels that are encoded with bit packing
+        // while the second is the byte-padded array of each so encoded slices.
+        //
+        // During decoding we map the relevant bits from one to the other.
+        let chunk_dims = self.chunk_dimensions()?;
+        let data_dims = self.chunk_data_dimensions(chunk_index)?;
+
+        let chunk_row_bytes: usize = layout.tiff_row_bytes;
+        let data_row_bytes: usize = layout.chunk_row_bytes(data_dims.0)?;
+
+        // TODO: Should these return errors instead?
+        assert!(layout.minimum_row_stride >= data_row_bytes);
+        assert!(buf.len() >= layout.row_stride * (data_dims.1 as usize - 1) + data_row_bytes);
+
+        let is_all_bits = samples == data_samples;
+        let is_output_chunk_rows = layout.row_stride == chunk_row_bytes;
+
+        let mut reader = Self::create_reader(
+            reader.inner(),
+            compression_method,
+            *compressed_bytes,
+            self.jpeg_tables.as_deref().map(|a| &**a),
+            chunk_dims,
+            self.samples,
+            self.fill_order,
+        )?;
+
+        // Extended bit depths (9-15, 17-31): packed N-bit samples must be unpacked to
+        // standard-width output samples before endianness fix and predictor.
+        let needs_unpacking = layout.tiff_bits_per_sample != layout.output_bits_per_sample
+            && layout.tiff_bits_per_sample > 8;
+
+        if needs_unpacking {
+            if !is_all_bits {
+                // Packed extended depths with extra samples to discard is not yet supported.
+                return Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::InterpretationWithBits(
+                        self.photometric_interpretation,
+                        vec![self.bits_per_sample; self.samples as usize],
+                    ),
+                ));
+            }
+
+            let tiff_bps = layout.tiff_bits_per_sample;
+            let out_bps = layout.output_bits_per_sample;
+            let samples_per_data_row = data_dims.0 as usize * samples as usize;
+
+            let mut packed = vec![0u8; chunk_row_bytes];
+
+            for row in buf.chunks_mut(layout.row_stride).take(data_dims.1 as usize) {
+                reader.read_exact(&mut packed)?;
+
+                let out_row = &mut row[..data_row_bytes];
+                unpack_bits(&packed, out_row, tiff_bps, samples_per_data_row, out_bps);
+
+                // Unpacked values are in native byte order, so pass native to skip
+                // endianness conversion while still applying the predictor.
+                super::fix_endianness_and_predict(
+                    out_row,
+                    color_type.bit_depth(),
+                    data_samples,
+                    ByteOrder::native(),
+                    predictor,
+                    scratch,
+                );
+
+                // An n-bit predictor delta is stored modulo 2^n, but the
+                // reconstruction above accumulated it in the promoted u16/u32
+                // storage width. Reduce back modulo the declared depth so both
+                // the inverted and non-inverted paths see exact, in-range
+                // values (2^n divides the storage modulus, so one mask after
+                // the row is exact).
+                super::mask_samples_to_bit_depth(out_row, tiff_bps, out_bps, self.sample_format);
+
+                super::post_process_row(
+                    out_row,
+                    photometric_interpretation,
+                    color_type,
+                    self.sample_format,
+                )?;
+            }
+        } else if is_output_chunk_rows && is_all_bits {
+            // Here we can read directly into the output buffer itself.
+            let tile = &mut buf[..chunk_row_bytes * data_dims.1 as usize];
+            reader.read_exact(tile)?;
+
+            for row in tile.chunks_mut(chunk_row_bytes) {
+                super::fix_endianness_and_predict(
+                    row,
+                    color_type.bit_depth(),
+                    samples,
+                    decompressed_byte_order,
+                    predictor,
+                    scratch,
+                );
+            }
+
+            // No-op in this branch: promoted layouts (declared depth < storage
+            // width) are handled exclusively by the unpacking branch above.
+            // Called in every integer branch so they cannot diverge.
+            super::mask_samples_to_bit_depth(
+                tile,
+                layout.tiff_bits_per_sample,
+                layout.output_bits_per_sample,
+                self.sample_format,
+            );
+
+            super::post_process_row(
+                tile,
+                photometric_interpretation,
+                color_type,
+                self.sample_format,
+            )?;
+        } else if chunk_row_bytes > data_row_bytes && self.predictor == Predictor::FloatingPoint {
+            // The floating point predictor shuffles the padding bytes into the encoded output, so
+            // this case is handled specially when needed.
+            let mut encoded = vec![0u8; chunk_row_bytes];
+            for row in buf.chunks_mut(layout.row_stride).take(data_dims.1 as usize) {
+                reader.read_exact(&mut encoded)?;
+
+                let row = &mut row[..data_row_bytes];
+                match color_type.bit_depth() {
+                    16 => {
+                        let (out, _) = row.as_chunks_mut::<2>();
+                        predict_f16(&mut encoded, out, samples);
+                    }
+                    32 => {
+                        let (out, _) = row.as_chunks_mut::<4>();
+                        predict_f32(&mut encoded, out, samples);
+                    }
+                    64 => {
+                        let (out, _) = row.as_chunks_mut::<8>();
+                        predict_f64(&mut encoded, out, samples);
+                    }
+                    _ => unreachable!(),
+                }
+                // No masking here: the floating point predictor requires
+                // IEEEFP samples, which are never depth-promoted.
+                super::post_process_row(
+                    row,
+                    photometric_interpretation,
+                    color_type,
+                    self.sample_format,
+                )?;
+            }
+        } else if is_all_bits {
+            // We read row-by-row but each row fits in its output buffer.
+            for row in buf.chunks_mut(layout.row_stride).take(data_dims.1 as usize) {
+                let row = &mut row[..data_row_bytes];
+                let used = data_row_bytes.min(chunk_row_bytes);
+
+                // Two ways how we get here: we have more bytes in our chunk data than in the image
+                // we are to read. Then we need to skip the rest of the data. Or we have a bigger
+                // row stride than the chunk contains data, then we  need to fill only the front.
+                reader.read_exact(&mut row[..used])?;
+                // Skip horizontal padding
+                if chunk_row_bytes > data_row_bytes {
+                    let len = u64::try_from(chunk_row_bytes - data_row_bytes)?;
+                    io::copy(&mut reader.by_ref().take(len), &mut io::sink())?;
+                }
+
+                super::fix_endianness_and_predict(
+                    row,
+                    color_type.bit_depth(),
+                    samples,
+                    decompressed_byte_order,
+                    predictor,
+                    scratch,
+                );
+
+                // No-op in this branch: promoted layouts only occur in the
+                // unpacking branch. Called so the integer branches cannot
+                // diverge.
+                super::mask_samples_to_bit_depth(
+                    row,
+                    layout.tiff_bits_per_sample,
+                    layout.output_bits_per_sample,
+                    self.sample_format,
+                );
+
+                super::post_process_row(
+                    row,
+                    photometric_interpretation,
+                    color_type,
+                    self.sample_format,
+                )?;
+            }
+        } else {
+            // The encoded data potentially takes up more space than the output data so we must be
+            // prepared to discard some of it. That decision is bit-by-bit.
+            let bits_per_pixel = u32::from(self.bits_per_sample) * u32::from(self.samples);
+            // Assumes the photometric samples are always the start.. This is slightly problematic.
+            // To expand spport we should instead have different methods of transforming the read
+            // buffer data, not only the `compact_photometric_bytes` method below and then choose
+            // from the right one with supplied parameters. Then we can also bit-for-bit copy with
+            // a selection for better performance.
+            let photometric_bit_end = u32::from(self.bits_per_sample) * data_samples as u32;
+
+            debug_assert!(bits_per_pixel >= photometric_bit_end);
+
+            if !bits_per_pixel.is_multiple_of(8) || !photometric_bit_end.is_multiple_of(8) {
+                return Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::InterpretationWithBits(
+                        self.photometric_interpretation,
+                        vec![self.bits_per_sample; self.samples as usize],
+                    ),
+                ));
+            }
+
+            let photo_range = photometric_bit_end / 8..bits_per_pixel / 8;
+            let mut encoded = vec![0u8; chunk_row_bytes];
+            for row in buf.chunks_mut(layout.row_stride).take(data_dims.1 as usize) {
+                // Clip to the chunk's data width: border chunks are stored at the full chunk
+                // width, and writing their horizontal padding would spill into the following
+                // output row (and predict/invert would run past the chunk's own columns).
+                let row = &mut row[..data_row_bytes];
+                reader.read_exact(&mut encoded)?;
+
+                Self::compact_photometric_bytes(&mut encoded, row, &photo_range);
+
+                super::fix_endianness_and_predict(
+                    row,
+                    color_type.bit_depth(),
+                    samples,
+                    decompressed_byte_order,
+                    predictor,
+                    scratch,
+                );
+
+                // No-op in this branch: promoted layouts only occur in the
+                // unpacking branch. Called so the integer branches cannot
+                // diverge.
+                super::mask_samples_to_bit_depth(
+                    row,
+                    layout.tiff_bits_per_sample,
+                    layout.output_bits_per_sample,
+                    self.sample_format,
+                );
+
+                super::post_process_row(
+                    row,
+                    photometric_interpretation,
+                    color_type,
+                    self.sample_format,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Turn a contiguous buffer of a whole number of raw sample arrays into a whole number of
+    /// photometric sample arrays by removing the extra samples in-between.
+    fn compact_photometric_bytes(
+        raw: &mut [u8],
+        row: &mut [u8],
+        photo_range: &std::ops::Range<u32>,
+    ) {
+        raw.chunks_exact_mut(photo_range.end as usize)
+            .zip(row.chunks_exact_mut(photo_range.start as usize))
+            .for_each(|(src, dst)| {
+                dst.copy_from_slice(&src[..photo_range.start as usize]);
+            });
+    }
+}
+
+/// Unpack N-bit packed samples (MSB-first) into standard-width output samples in native byte
+/// order. Packed bits are read from `src` and expanded samples are written to `dst`.
+///
+/// `bits_per_sample` is the packed depth (e.g. 10, 12, 14).
+/// `num_samples` is the number of samples to extract.
+/// `output_width` is the output sample width in bits (16 or 32).
+///
+/// # Panics
+///
+/// Panics if `dst` is too small for `num_samples` output samples.
+fn unpack_bits(
+    src: &[u8],
+    dst: &mut [u8],
+    bits_per_sample: u8,
+    num_samples: usize,
+    output_width: u8,
+) {
+    // Dispatch to const-generic specializations so the compiler can unroll the
+    // byte-gathering loop and precompute shift/mask constants.
+    macro_rules! dispatch {
+        ($($bps:literal),+) => {
+            match bits_per_sample {
+                $( $bps => unpack_bits_const::<$bps>(src, dst, num_samples, output_width), )+
+                _ => unpack_bits_const::<0>(src, dst, num_samples, output_width),
+            }
+        };
+    }
+    // Cover every bit depth from 9..=32 that could reach this path, plus 0 as fallback.
+    dispatch!(
+        9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+        32
+    );
+}
+
+/// Inner loop with const BPS so the compiler can optimize the bit extraction.
+/// BPS=0 is the fallback for unexpected bit depths (uses runtime value).
+#[inline(always)]
+fn unpack_bits_const<const BPS: u8>(
+    src: &[u8],
+    dst: &mut [u8],
+    num_samples: usize,
+    output_width: u8,
+) {
+    debug_assert!(output_width == 16 || output_width == 32);
+
+    match output_width {
+        16 => {
+            debug_assert!(dst.len() >= num_samples * 2);
+            let mut bit_offset: usize = 0;
+            for i in 0..num_samples {
+                let val = if BPS > 0 {
+                    extract_bits_msb_const::<BPS>(src, bit_offset)
+                } else {
+                    extract_bits_msb_const::<16>(src, bit_offset) // unreachable fallback
+                };
+                dst[i * 2..i * 2 + 2].copy_from_slice(&(val as u16).to_ne_bytes());
+                bit_offset += if BPS > 0 { BPS as usize } else { 16 };
+            }
+        }
+        32 => {
+            debug_assert!(dst.len() >= num_samples * 4);
+            let mut bit_offset: usize = 0;
+            for i in 0..num_samples {
+                let val = if BPS > 0 {
+                    extract_bits_msb_const::<BPS>(src, bit_offset)
+                } else {
+                    extract_bits_msb_const::<32>(src, bit_offset) // unreachable fallback
+                };
+                dst[i * 4..i * 4 + 4].copy_from_slice(&val.to_ne_bytes());
+                bit_offset += if BPS > 0 { BPS as usize } else { 32 };
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Extract a value of `BPS` bits starting at `bit_offset` from an MSB-first packed byte stream.
+/// Uses a single wide read + shift/mask for branchless extraction.
+#[inline(always)]
+fn extract_bits_msb_const<const BPS: u8>(src: &[u8], bit_offset: usize) -> u32 {
+    let byte_idx = bit_offset / 8;
+    let bit_idx = bit_offset % 8;
+    let mask: u64 = (1u64 << BPS) - 1;
+
+    // Read a u64 from as many bytes as available, big-endian, without going out of bounds.
+    // For BPS <= 32 (+ up to 7 bits offset = 39 bits max), we need at most 5 bytes,
+    // but reading 8 at once is faster and the branch is only taken near row ends.
+    let remaining = src.len() - byte_idx;
+    let acc = if remaining >= 8 {
+        u64::from_be_bytes(src[byte_idx..byte_idx + 8].try_into().unwrap())
+    } else {
+        // Near the end of the buffer — read available bytes into the high bits of a u64.
+        let mut buf = [0u8; 8];
+        buf[..remaining].copy_from_slice(&src[byte_idx..]);
+        u64::from_be_bytes(buf)
+    };
+
+    // The value starts at bit_idx from the MSB of our u64. Shift it to the LSB and mask.
+    let shift = 64 - bit_idx - BPS as usize;
+    ((acc >> shift) & mask) as u32
+}
+
+impl ReadoutLayout {
+    pub(crate) fn samples_per_out_texel(&self) -> u16 {
+        match self.planar_config {
+            PlanarConfiguration::Chunky => self.color.num_samples(),
+            PlanarConfiguration::Planar => 1,
+        }
+    }
+
+    // For a concrete chunk, which may be a partial border chunk, the byte length of one row of its
+    // pixel data.
+    pub(crate) fn chunk_row_bytes(&self, width: u32) -> TiffResult<usize> {
+        let data_samples = self.samples_per_out_texel();
+        let data_row_bits = (u64::from(width) * u64::from(self.output_bits_per_sample))
+            .checked_mul(u64::from(data_samples))
+            .ok_or(TiffError::LimitsExceeded)?;
+        Ok(data_row_bits.div_ceil(8).try_into()?)
+    }
+
+    pub(crate) fn set_row_stride(&mut self, row_stride: usize) -> Result<(), TiffError> {
+        if row_stride < self.minimum_row_stride {
+            return Err(TiffError::UsageError(
+                UsageError::InsufficientOutputRowStride {
+                    needed: self.minimum_row_stride,
+                    requested: row_stride,
+                },
+            ));
+        }
+
+        let data_row_bytes = u64::try_from(row_stride)?;
+
+        // Use the original image height (from plane_stride / row_stride) to clamp
+        // the chunk height, matching the clamping in readout_for_size().
+        let image_height = self.plane_stride.checked_div(self.row_stride).unwrap_or(0) as u32;
+        let clamped_chunk_height = self.tiff_chunk_dimensions.1.min(image_height);
+        let chunk_col_stride = data_row_bytes
+            .checked_mul(u64::from(clamped_chunk_height))
+            .ok_or(TiffError::LimitsExceeded)?
+            .try_into()?;
+
+        let height = self.plane_stride.checked_div(self.row_stride);
+
+        let plane_stride = height
+            .and_then(|h| data_row_bytes.checked_mul(h as u64))
+            // If height was zero, or the previous stride was zero, there are no bytes in a plane
+            .unwrap_or(0)
+            .try_into()?;
+
+        self.row_stride = row_stride;
+        self.chunk_col_stride = chunk_col_stride;
+        self.plane_stride = plane_stride;
+
+        Ok(())
+    }
+
+    /// Reduce this down to the layout of the output planes.
+    pub(crate) fn to_plane_layout(&self) -> Result<PlaneLayout, TiffError> {
+        let num_planes = self.color.num_samples() / self.samples_per_out_texel();
+
+        // Using the standard range iterator as checked_add on steroids.
+        //
+        // Note: for supporting subsampling, adjust as required.
+        let mut offset = (0..=usize::MAX).step_by(self.plane_stride);
+
+        let plane_offsets = offset.by_ref().take(usize::from(num_planes)).collect();
+
+        // Get the past-the-end of the last plane.
+        //
+        // This also verifies the `take` above was not short.
+        let Some(total_bytes) = offset.next() else {
+            return Err(TiffError::LimitsExceeded);
+        };
+
+        Ok(PlaneLayout {
+            plane_offsets,
+            total_bytes,
+            readout: self.clone(),
+        })
+    }
+}
+
+/// A `ReadoutLayout` with pre-calculated plane information.
+pub(crate) struct PlaneLayout {
+    /// The underlying readout layout.
+    pub readout: ReadoutLayout,
+    /// Buffer offset from one plane of output to the next.
+    pub plane_offsets: Vec<usize>,
+    /// Total number of bytes for all planes in given order.
+    pub total_bytes: usize,
+}
+
+impl PlaneLayout {
+    /// Return the number of planes to extract into the provided buffer.
+    pub(crate) fn used_planes(&self, buffer: &[impl Sized]) -> TiffResult<u16> {
+        self.readout.assert_min_layout(buffer)?;
+        let buffer_len = core::mem::size_of_val(buffer);
+
+        // Note: with differently sized planes this is dependent on the plane.
+        let last_plane_start = buffer_len.checked_sub(self.readout.plane_stride);
+
+        // Find how many planes fit into the output buffer.
+        let used_plane_offsets = self
+            .plane_offsets
+            .iter()
+            .enumerate()
+            // Find the first plane that would not fit completely at its offset.
+            .skip_while(|(_, &offset)| last_plane_start >= Some(offset))
+            .nth(0)
+            // If all planes fit, use all of them.
+            .map_or(self.plane_offsets.len(), |(idx, _)| idx);
+
+        debug_assert!(
+            used_plane_offsets <= usize::from(u16::MAX),
+            "Planes limited by number of samples, which is encoded as u16"
+        );
+
+        Ok(used_plane_offsets as u16)
+    }
+}
